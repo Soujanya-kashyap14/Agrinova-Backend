@@ -1,0 +1,39 @@
+{
+    "model": "EfficientNetB0",
+    "task": "tomato_quality_classification",
+    "classes": [
+        "fresh",
+        "rotten"
+    ],
+    "class_mapping": {
+        "0": "fresh",
+        "1": "rotten"
+    },
+    "image_size": [
+        224,
+        224
+    ],
+    "dataset": "C:\\Users\\USER\\Downloads\\agriwise-ai-52-with-auth\\agriwise-ai-52-main1-main\\backend\\datasets\\tomato\\quality",
+    "fresh_images": 1350,
+    "rotten_images": 636,
+    "total_images": 1986,
+    "training_images": 1588,
+    "validation_images": 398,
+    "training_fresh": 1079,
+    "training_rotten": 509,
+    "validation_fresh": 271,
+    "validation_rotten": 127,
+    "validation_split": 0.2,
+    "random_seed": 42,
+    "preprocessing": "EfficientNetB0 built-in preprocessing; input range 0-255",
+    "decision_threshold": 0.5,
+    "tensorflow_version": "2.21.0",
+    "keras_version": "3.15.1",
+    "metrics": {
+        "accuracy": 0.9698492288589478,
+        "auc": 0.998053252696991,
+        "loss": 0.11044584959745407,
+        "precision": 0.9259259104728699,
+        "recall": 0.9842519760131836
+    }
+}

@@ -1,0 +1,16 @@
+{
+    "image_size": [
+        224,
+        224
+    ],
+    "quality_classes": [
+        "fresh",
+        "rotten"
+    ],
+    "maturity_classes": [
+        "immature",
+        "mature"
+    ],
+    "verifier_threshold": 0.48133904933929444,
+    "dataset_structure": "datasets/tomato/"
+}
