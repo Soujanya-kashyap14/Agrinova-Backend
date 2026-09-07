@@ -17,6 +17,61 @@ This version:
 from __future__ import annotations
 
 import sys
+
+# ------------------------------------------------------------------
+# Windows consoles default stdout/stderr to a legacy codepage (e.g.
+# cp1252), which cannot encode Kannada/Telugu/Tamil/Malayalam/Hindi
+# script characters. Any print() of recognized non-English speech
+# (see services/speech_service.py) then raises UnicodeEncodeError,
+# which is uncaught and turns into a 500 for the whole voice
+# request — the farmer's speech was transcribed correctly, but the
+# request crashes before ever reaching Gemini. Force UTF-8 output
+# as early as possible so debug logging never crashes a request.
+# ------------------------------------------------------------------
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+# ------------------------------------------------------------------
+# Every external API this app calls (Gemini, Groq, Open-Meteo,
+# OpenWeatherMap, the geocoder, Google Translate for TTS) publishes
+# an IPv6 address alongside its IPv4 ones. On this machine/network,
+# IPv6 routes are effectively dead - not refused, just silently
+# unreachable - so any connection attempt on them hangs until a
+# ~20-25s OS-level timeout before urllib3 (which `requests` and the
+# Gemini SDK use under the hood) falls back to IPv4, which then
+# succeeds instantly. Measured directly: a single Groq transcription
+# call dropped from ~23s to ~2s once IPv6 was taken out of the
+# picture. Since nearly every voice/weather/chat request makes
+# multiple such calls, this one setting was very likely the single
+# biggest contributor to "everything is slow" across the whole app.
+# Forcing IPv4-only resolution here (before anything else imports
+# requests/urllib3) applies to every outbound call in the process.
+# ------------------------------------------------------------------
+
+try:
+    import socket
+
+    # Patching urllib3 alone isn't enough: the Gemini SDK (google-genai)
+    # goes through httpx, not requests/urllib3. Patching the stdlib
+    # socket.getaddrinfo directly is the one point both libraries (and
+    # anything else built on Python sockets) ultimately resolve
+    # through, so this single patch covers Groq, weather/geocoding
+    # (requests) and Gemini (httpx) alike.
+    _original_getaddrinfo = socket.getaddrinfo
+
+    def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        return _original_getaddrinfo(
+            host, port, socket.AF_INET, type, proto, flags
+        )
+
+    socket.getaddrinfo = _ipv4_only_getaddrinfo
+except Exception:
+    pass
+
 from contextlib import asynccontextmanager
 from pathlib import Path
 

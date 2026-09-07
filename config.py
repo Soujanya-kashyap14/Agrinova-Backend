@@ -50,6 +50,18 @@ class Settings(BaseSettings):
     # OpenWeather
     # ------------------------------------------------------------------
     openweather_api_key: str = ""
+
+    # ------------------------------------------------------------------
+    # Groq (optional, cloud Whisper large-v3 for speech-to-text)
+    #
+    # When set, voice recognition prefers this over the local
+    # Whisper "small" model - much higher accuracy and far faster,
+    # since it runs on Groq's hardware instead of this machine's
+    # CPU. The local pipeline remains an automatic fallback if this
+    # is unset or a request to Groq fails. Get a free key at
+    # https://console.groq.com/keys
+    # ------------------------------------------------------------------
+    groq_api_key: str = ""
     
     
     

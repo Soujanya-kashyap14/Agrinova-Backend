@@ -34,12 +34,12 @@ MODEL_PATH = (
 # Training parameters
 IMAGE_SIZE = (224, 224)
 BATCH_SIZE = 32
-EPOCHS = 15
+EPOCHS = 3
 SEED = 42
 
 # Maximum number of images from each dataset
 # We use all available images up to these limits.
-MAX_TRAIN_IMAGES = 50000
+MAX_TRAIN_IMAGES = 3000
 MAX_TEST_IMAGES = 15000
 
 

@@ -23,6 +23,7 @@ Live information is supplied separately whenever available.
 
 import json
 import re
+import time
 
 from google import genai
 
@@ -49,7 +50,98 @@ client = genai.Client(
     api_key=settings.gemini_api_key
 )
 
-MODEL_NAME = "gemini-flash-latest"
+
+# IMPORTANT: pinned to a specific stable model, not a "-latest"
+# alias. "-latest" silently follows whatever Google considers
+# newest, which can point at a brand-new preview model with a
+# tiny free-tier daily quota (we measured "gemini-flash-latest"
+# resolving to "gemini-3.8-flash" with a 20-REQUESTS-PER-DAY free
+# quota - exhausted almost immediately during normal testing,
+# which is exactly what caused the assistant to appear "not
+# working at all"). Pinning avoids that trap recurring silently
+# if Google repoints the alias again.
+MODEL_NAME = "gemini-3.1-flash-lite"
+
+
+# ==========================================================
+# GEMINI CALL WITH RETRY
+# ==========================================================
+#
+# Gemini occasionally returns a transient 503 ("high demand,
+# usually temporary") or 429 (rate limit). Without a retry, a
+# single transient blip immediately falls back to the canned
+# "I am temporarily unable to process that request" message,
+# even though trying again a couple of seconds later usually
+# succeeds. This is a network-bound wait, not a CPU-bound one
+# like Whisper, so a couple of short retries is cheap insurance.
+# ==========================================================
+
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def _is_retryable_gemini_error(exc: Exception) -> bool:
+
+    # A per-DAY quota being exhausted cannot be fixed by waiting
+    # a few seconds - only by waiting until the next day's reset
+    # or upgrading the plan. Retrying just adds ~9 seconds of
+    # dead time before failing anyway, which is exactly the kind
+    # of "hangs and then does nothing" experience that makes the
+    # assistant look broken. A per-MINUTE limit, by contrast, can
+    # genuinely clear within the retry window, so it still gets
+    # retried below.
+    if "PerDay" in str(exc):
+        return False
+
+    code = getattr(exc, "code", None)
+
+    if code in RETRYABLE_STATUS_CODES:
+        return True
+
+    # Some SDK versions raise ServerError for 5xx failures
+    # without a populated `.code` attribute.
+    return type(exc).__name__ == "ServerError"
+
+
+def _generate_content_with_retry(
+    prompt: str,
+    max_attempts: int = 3,
+):
+
+    last_error: Exception = RuntimeError(
+        "Gemini call failed with no attempts made."
+    )
+
+    for attempt in range(1, max_attempts + 1):
+
+        try:
+
+            return client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+            )
+
+        except Exception as exc:
+
+            last_error = exc
+
+            if (
+                attempt == max_attempts
+                or not _is_retryable_gemini_error(exc)
+            ):
+                raise
+
+            wait_seconds = attempt * 1.5
+
+            print(
+                f"Gemini call failed (attempt {attempt}/"
+                f"{max_attempts}), retrying in "
+                f"{wait_seconds:.1f}s:",
+                exc,
+            )
+
+            time.sleep(wait_seconds)
+
+    raise last_error
 
 
 # ==========================================================
@@ -121,7 +213,18 @@ IMPORTANT DATA RULES:
   follow the product label and local agriculture officer
   recommendation.
 - Avoid unsafe pesticide mixing instructions.
-- Keep answers concise enough for voice.
+- KEEP ANSWERS SHORT: about 4-6 sentences for a typical
+  question, spoken the way you'd naturally talk to someone,
+  not written as a report. Cover only the 2-3 most important
+  points instead of every possible one. Only go longer than
+  that if the farmer explicitly asks for full details or a
+  step-by-step explanation.
+- Do NOT use markdown formatting: no **bold**, no bullet
+  points starting with * or -, no # headings. Write in plain
+  spoken sentences only. This answer is shown as plain text
+  and read aloud by text-to-speech, neither of which
+  understands markdown - a farmer would see literal asterisk
+  characters or hear them read aloud as punctuation.
 """
 
 
@@ -137,6 +240,90 @@ LANGUAGE_NAMES = {
     "ta": "Tamil",
     "ml": "Malayalam",
 }
+
+
+# ==========================================================
+# KEYWORD MATCHING - TOLERANT OF MINOR ASR TRANSCRIPTION SLIPS
+# ==========================================================
+#
+# All of the is_X_question() intent checks below match keywords as
+# plain substrings. That's brittle for Indic scripts: a real farmer
+# recording of "ಹವಾಮಾನ" (weather) can come back from Whisper/Groq as
+# "ಹವಮಾನ" - missing a single vowel sign - which is a completely
+# different string for `in`, even though the consonant skeleton (and
+# the word a human would recognize) is identical. Stripping the
+# dependent vowel signs (matras) from both the question and the
+# keyword before comparing absorbs exactly this class of small ASR
+# noise across all five supported Indic scripts, without needing a
+# fuzzy-matching library.
+# ==========================================================
+
+def _char_range(start: int, end: int) -> str:
+    """All characters from codepoint `start` to `end`, inclusive."""
+    return "".join(chr(c) for c in range(start, end + 1))
+
+
+_INDIC_VOWEL_SIGNS = (
+    _char_range(0x093E, 0x094D)  # Devanagari (Hindi): vowel signs + virama
+    + _char_range(0x0962, 0x0963)  # Devanagari: vocalic L vowel signs
+    + _char_range(0x0BBE, 0x0BCD)  # Tamil: vowel signs + virama
+    + _char_range(0x0C3E, 0x0C4D)  # Telugu: vowel signs + virama
+    + _char_range(0x0CBE, 0x0CCD)  # Kannada: vowel signs + virama
+    + _char_range(0x0D3E, 0x0D4D)  # Malayalam: vowel signs + virama
+)
+
+_INDIC_VOWEL_SIGN_PATTERN = re.compile(
+    "[" + re.escape(_INDIC_VOWEL_SIGNS) + "]"
+)
+
+
+def _normalize_for_matching(text: str) -> str:
+    return _INDIC_VOWEL_SIGN_PATTERN.sub(
+        "",
+        text.lower(),
+    )
+
+
+# A short keyword (2-3 characters after normalization) is a common
+# syllable sequence that turns up embedded inside many unrelated
+# words in Indic scripts - e.g. Hindi "दर" ("rate") also
+# occurs inside "दुर्ग" (Durg, part of the
+# city name Chitradurga), "सुंदर"
+# (beautiful) and "अंदर" (inside) - a plain
+# substring match on a keyword this short produces false positives
+# like Durg/Chitradurga being misread as a price question. Requiring
+# it to be a standalone word (boundaries on both sides) avoids that.
+SHORT_KEYWORD_LENGTH = 3
+
+
+def _contains_any_keyword(question: str, keywords: list[str]) -> bool:
+    normalized_question = _normalize_for_matching(question)
+
+    for keyword in keywords:
+
+        normalized_keyword = _normalize_for_matching(keyword)
+
+        if not normalized_keyword:
+            continue
+
+        escaped = re.escape(normalized_keyword)
+
+        if len(normalized_keyword) <= SHORT_KEYWORD_LENGTH:
+            pattern = r"\b" + escaped + r"\b"
+        else:
+            # Longer, more specific keywords are safe to match at the
+            # start of a larger word too, since Indic compound nouns
+            # are often written with no space at all (e.g. Kannada
+            # "ಹವಮನವರದಿ" =
+            # "weather" + "report" glued together). A left boundary
+            # still rules out the keyword turning up mid-word inside
+            # something unrelated.
+            pattern = r"\b" + escaped
+
+        if re.search(pattern, normalized_question):
+            return True
+
+    return False
 
 
 # ==========================================================
@@ -165,6 +352,10 @@ WEATHER_KEYWORDS = [
     "बारिश",
     "वर्षा",
     "तापमान",
+    # Regional loanword variant (Marathi/Kannada-influenced), heard
+    # in practice from farmers near the Karnataka/Maharashtra border
+    # even while speaking Hindi.
+    "हवामान",
 
     "వాతావరణం",
     "వర్షం",
@@ -181,13 +372,7 @@ WEATHER_KEYWORDS = [
 
 
 def is_weather_question(question: str) -> bool:
-
-    q = question.lower()
-
-    return any(
-        keyword.lower() in q
-        for keyword in WEATHER_KEYWORDS
-    )
+    return _contains_any_keyword(question, WEATHER_KEYWORDS)
 
 
 # ==========================================================
@@ -232,13 +417,7 @@ PRICE_KEYWORDS = [
 
 
 def is_price_question(question: str) -> bool:
-
-    q = question.lower()
-
-    return any(
-        keyword.lower() in q
-        for keyword in PRICE_KEYWORDS
-    )
+    return _contains_any_keyword(question, PRICE_KEYWORDS)
 
 
 # ==========================================================
@@ -279,13 +458,7 @@ FERTILIZER_KEYWORDS = [
 
 
 def is_fertilizer_question(question: str) -> bool:
-
-    q = question.lower()
-
-    return any(
-        keyword.lower() in q
-        for keyword in FERTILIZER_KEYWORDS
-    )
+    return _contains_any_keyword(question, FERTILIZER_KEYWORDS)
 
 
 # ==========================================================
@@ -326,13 +499,7 @@ PESTICIDE_KEYWORDS = [
 
 
 def is_pesticide_question(question: str) -> bool:
-
-    q = question.lower()
-
-    return any(
-        keyword.lower() in q
-        for keyword in PESTICIDE_KEYWORDS
-    )
+    return _contains_any_keyword(question, PESTICIDE_KEYWORDS)
 
 
 # ==========================================================
@@ -373,13 +540,7 @@ DISEASE_KEYWORDS = [
 
 
 def is_disease_question(question: str) -> bool:
-
-    q = question.lower()
-
-    return any(
-        keyword.lower() in q
-        for keyword in DISEASE_KEYWORDS
-    )
+    return _contains_any_keyword(question, DISEASE_KEYWORDS)
 
 
 # ==========================================================
@@ -411,13 +572,7 @@ IRRIGATION_KEYWORDS = [
 
 
 def is_irrigation_question(question: str) -> bool:
-
-    q = question.lower()
-
-    return any(
-        keyword.lower() in q
-        for keyword in IRRIGATION_KEYWORDS
-    )
+    return _contains_any_keyword(question, IRRIGATION_KEYWORDS)
 
 
 # ==========================================================
@@ -454,13 +609,7 @@ SCHEME_KEYWORDS = [
 
 
 def is_scheme_question(question: str) -> bool:
-
-    q = question.lower()
-
-    return any(
-        keyword.lower() in q
-        for keyword in SCHEME_KEYWORDS
-    )
+    return _contains_any_keyword(question, SCHEME_KEYWORDS)
 
 
 # ==========================================================
@@ -477,6 +626,15 @@ The location may be:
 - district
 - village
 - town
+
+IMPORTANT: The farmer's question may be in Kannada, Hindi, Telugu,
+Tamil, Malayalam or English. Always return the location's name in
+ENGLISH (Latin script), transliterated/translated as needed, even
+when the question itself is in another language and script - for
+example "ಮಂಗಳೂರು" or "मंगलौर" should both be returned as "Mangalore".
+This is required because the location name is looked up against a
+geocoding service that only recognizes English place names and
+returns zero results for native-script input.
 
 Return ONLY valid JSON.
 
@@ -495,10 +653,7 @@ Farmer question:
 
     try:
 
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=prompt,
-        )
+        response = _generate_content_with_retry(prompt)
 
         text = (response.text or "").strip()
 
@@ -583,8 +738,16 @@ Sunset: {current.get("sunset", "N/A")}
 # WEATHER CITY
 # ==========================================================
 
-def get_weather_for_question(question: str):
-
+def get_weather_for_question(
+    question: str,
+    latitude: str | None = None,
+    longitude: str | None = None,
+):
+    # A farmer who names a specific place ("Mangalore's weather
+    # report") means exactly that place - even if their phone's GPS
+    # says they're physically somewhere else right now. Check for a
+    # named location FIRST, and only fall back to the device's GPS
+    # position when the question doesn't name one.
     city = extract_city(question)
 
     print(
@@ -606,8 +769,44 @@ def get_weather_for_question(question: str):
                 "Weather lookup by city failed:",
                 e,
             )
+            # Fall through to GPS below rather than giving up.
+
+    if latitude and longitude:
+        try:
+            return get_live_weather(
+                lat=float(latitude),
+                lng=float(longitude),
+            )
+        except (TypeError, ValueError) as exc:
+            print("Weather coordinate lookup failed:", exc)
 
     return None
+
+
+# ==========================================================
+# STRIP MARKDOWN BEFORE DISPLAYING
+# ==========================================================
+#
+# The chat UI (ChatBubble.tsx) renders `assistant_reply` as plain
+# text with no markdown parser, so "**bold**" or a "* bullet" shows
+# up as literal asterisks on screen. The system prompt already asks
+# Gemini not to use markdown, but LLMs habitually reach for it anyway
+# - this is the safety net for when that instruction gets ignored.
+# Unlike the separate TTS-input cleanup in tts_service.py, this
+# preserves line breaks and numbered lists, since those read fine in
+# a plain-text chat bubble - only the asterisk/header markup itself
+# needs to go.
+# ==========================================================
+
+def _strip_markdown_for_display(text: str) -> str:
+
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"\*(.*?)\*", r"\1", text)
+    text = re.sub(r"(?m)^#{1,6}\s*", "", text)
+    text = re.sub(r"(?m)^\s*[-*]\s+", "", text)
+
+    # Catch-all for any stray/unpaired asterisks that slip through.
+    return text.replace("*", "")
 
 
 # ==========================================================
@@ -617,6 +816,8 @@ def get_weather_for_question(question: str):
 async def generate_response(
     question: str,
     language: str,
+    latitude: str | None = None,
+    longitude: str | None = None,
 ):
 
     question = (question or "").strip()
@@ -680,7 +881,9 @@ async def generate_response(
     if is_weather_question(question):
 
         weather = get_weather_for_question(
-            question
+            question,
+            latitude,
+            longitude,
         )
 
         prompt = f"""
@@ -764,7 +967,8 @@ Farmer question:
 
 Give practical advice.
 
-Include, when relevant:
+Pick only the 2-3 most relevant of these, don't cover
+every one:
 
 - suitable fertilizer type
 - NPK purpose
@@ -802,7 +1006,8 @@ Farmer question:
 
 Give practical and safe guidance.
 
-Cover, when relevant:
+Pick only the 2-3 most relevant of these, don't cover
+every one:
 
 - likely pest/disease
 - prevention
@@ -838,14 +1043,15 @@ Farmer language:
 Farmer question:
 {question}
 
-Explain:
+Briefly cover only the 2-3 most useful of these,
+don't work through every one:
 
-1. likely cause
-2. visible symptoms
-3. immediate action
-4. prevention
-5. organic options
-6. chemical treatment category when appropriate
+- likely cause
+- visible symptoms
+- immediate action
+- prevention
+- organic options
+- chemical treatment category when appropriate
 
 Do not claim a diagnosis with certainty from text alone.
 
@@ -872,7 +1078,8 @@ Farmer language:
 Farmer question:
 {question}
 
-Give practical advice about:
+Give practical advice, picking only the 2-3 most
+relevant of these rather than covering every one:
 
 - watering frequency
 - soil moisture
@@ -905,9 +1112,8 @@ Farmer language:
 Farmer question:
 {question}
 
-Explain the scheme simply.
-
-Include:
+Explain the scheme simply, covering only the 2-3
+most useful of these rather than every one:
 
 - purpose
 - who may qualify
@@ -973,10 +1179,7 @@ Keep the answer concise and useful for voice.
         print("Question:", question)
         print("=" * 60)
 
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=prompt,
-        )
+        response = _generate_content_with_retry(prompt)
 
         answer = (
             response.text or ""
@@ -1140,6 +1343,8 @@ Keep the answer concise and useful for voice.
     # ------------------------------------------------------
     # RETURN
     # ------------------------------------------------------
+
+    answer = _strip_markdown_for_display(answer)
 
     return {
         "question": question,

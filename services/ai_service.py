@@ -226,9 +226,16 @@ def _normalize_result(
     # Strings
     # --------------------------------------------------------
 
+    is_tomato = bool(
+        normalized.get(
+            "is_tomato",
+            False,
+        )
+    )
+
     normalized["crop"] = _safe_string(
         normalized.get("crop"),
-        "Unknown",
+        "Tomato" if is_tomato else "Unknown",
     )
 
     normalized["quality_label"] = _safe_string(
@@ -319,8 +326,26 @@ def _normalize_result(
     normalized["tomato_verified"] = bool(
         normalized.get(
             "tomato_verified",
-            False,
+            is_tomato,
         )
+    )
+
+    normalized["tomato_verification_reason"] = _safe_string(
+        normalized.get(
+            "tomato_verification_reason",
+            normalized.get("verification_message"),
+        ),
+        "",
+    )
+
+    normalized["rejection_reason"] = _safe_string(
+        normalized.get(
+            "rejection_reason",
+            normalized.get("verification_message")
+            if not is_tomato
+            else "",
+        ),
+        "",
     )
 
     # --------------------------------------------------------

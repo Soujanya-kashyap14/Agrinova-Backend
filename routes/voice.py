@@ -1,4 +1,5 @@
 import os
+import json
 import uuid
 
 from fastapi import (
@@ -12,6 +13,9 @@ from fastapi import (
 from services.speech_service import speech_to_text
 from services.assistant_service import generate_response
 from services.tts_service import text_to_speech
+from utils.conversation import build_question_with_context
+from utils.language import detect_script_language
+from models.voice import TextChatRequest
 
 
 router = APIRouter(
@@ -21,6 +25,15 @@ router = APIRouter(
 
 
 UPLOAD_DIR = "uploads/audio"
+
+SUPPORTED_LANGUAGES = {
+    "en",
+    "kn",
+    "hi",
+    "te",
+    "ta",
+    "ml",
+}
 
 os.makedirs(
     UPLOAD_DIR,
@@ -35,6 +48,8 @@ async def voice_chat(
     latitude: str | None = Form(None),
     longitude: str | None = Form(None),
     location: str | None = Form(None),
+    language: str | None = Form(None),
+    conversation: str | None = Form(None),
 ):
 
     filepath = None
@@ -88,12 +103,19 @@ async def voice_chat(
             len(audio_data),
         )
 
+        # The selected UI language is only a fallback hint for uncertain
+        # audio. Whisper still detects the spoken language on its fast pass.
+        requested_language = (language or "").strip().lower()
+        if requested_language not in SUPPORTED_LANGUAGES:
+            requested_language = None
+
         # ==================================================
         # SPEECH
         # ==================================================
 
         speech = await speech_to_text(
-            filepath
+            filepath,
+            language_hint=requested_language,
         )
 
         print(type(speech))
@@ -104,10 +126,24 @@ async def voice_chat(
             .strip()
         )
 
-        language = (
+        detected_language = (
             speech.get("language", "en")
             or "en"
         )
+
+        # The transcribed TEXT's own script is ground truth for what
+        # language the farmer actually spoke - it can't be stale or
+        # defaulted the way a UI toggle can. Only fall back to the UI
+        # selection, then to Whisper's own language guess, when the
+        # text is plain Latin script and gives no script signal.
+        script_language = detect_script_language(text)
+
+        if script_language:
+            detected_language = script_language
+        elif requested_language:
+            detected_language = requested_language
+
+        language = detected_language
 
         # ==================================================
         # EMPTY SPEECH
@@ -144,7 +180,10 @@ async def voice_chat(
 
             return {
                 "success": False,
-                "recognized_text": "",
+                "recognized_text": empty_answers.get(
+                    language,
+                    empty_answers["en"],
+                ),
                 "language": language,
                 "assistant_reply": empty_answers.get(
                     language,
@@ -192,18 +231,27 @@ async def voice_chat(
         # when the browser supplied it.
         # --------------------------------------------------
 
-        question_for_assistant = text
+        history = None
 
-        if location:
+        if conversation:
+            try:
+                parsed = json.loads(conversation)
+                if isinstance(parsed, list):
+                    history = parsed
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
 
-            question_for_assistant = (
-                f"{text}\n\n"
-                f"Farmer's current location: {location}"
-            )
+        question_for_assistant = build_question_with_context(
+            text,
+            history,
+            location,
+        )
 
         assistant = await generate_response(
             question_for_assistant,
             language,
+            latitude,
+            longitude,
         )
 
         print(type(assistant))
@@ -283,3 +331,105 @@ async def voice_chat(
                 "Audio cleanup error:",
                 cleanup_error,
             )
+
+
+# ==============================================================
+# TEXT CHAT
+# ==============================================================
+#
+# Same Gemini-backed reasoning as /chat, minus the speech-to-text
+# step. Lets a farmer type instead of speak - useful by itself,
+# and as a reliable fallback when microphone/audio conditions
+# make voice recognition unreliable.
+# ==============================================================
+
+@router.post("/text-chat")
+async def voice_text_chat(
+    payload: TextChatRequest,
+):
+
+    try:
+
+        question = (payload.question or "").strip()
+
+        if not question:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Question is required.",
+            )
+
+        requested_language = (
+            (payload.language or "").strip().lower()
+        )
+
+        if requested_language not in SUPPORTED_LANGUAGES:
+            requested_language = "en"
+
+        # Same rule as voice chat: what the farmer actually typed
+        # (its script) overrides the UI toggle, since the toggle may
+        # not match the language the farmer is typing in right now.
+        script_language = detect_script_language(question)
+        language = script_language if script_language else requested_language
+
+        history = (
+            [
+                {
+                    "sender": message.sender,
+                    "text": message.text,
+                }
+                for message in payload.conversation
+            ]
+            if payload.conversation
+            else None
+        )
+
+        question_for_assistant = build_question_with_context(
+            question,
+            history,
+            payload.location,
+        )
+
+        print("\n========== TEXT CHAT ==========")
+        print("Question:", question)
+        print("Language:", language)
+
+        assistant = await generate_response(
+            question_for_assistant,
+            language,
+            payload.latitude,
+            payload.longitude,
+        )
+
+        answer = (
+            assistant.get("answer", "")
+            or ""
+        ).strip()
+
+        audio = await text_to_speech(
+            answer,
+            language,
+        )
+
+        return {
+            "success": True,
+            "recognized_text": question,
+            "language": language,
+            "assistant_reply": answer,
+            "audio_url": audio.get("audio_url"),
+            "weather": assistant.get("weather"),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        import traceback
+
+        traceback.print_exc()
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+        )

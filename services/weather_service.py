@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -14,6 +14,14 @@ except Exception:
 
 OPEN_METEO_FORECAST_URL = (
     "https://api.open-meteo.com/v1/forecast"
+)
+
+OPENWEATHER_CURRENT_URL = (
+    "https://api.openweathermap.org/data/2.5/weather"
+)
+
+OPENWEATHER_FORECAST_URL = (
+    "https://api.openweathermap.org/data/2.5/forecast"
 )
 
 
@@ -466,6 +474,108 @@ def _get_location_name(
 
 
 # ============================================================
+# FORWARD GEOCODING (name -> coordinates)
+# ============================================================
+
+def _geocode_location(
+    location: str,
+) -> Optional[Dict[str, Any]]:
+
+    # This app is exclusively for Indian farmers, but the geocoding
+    # API has no concept of that and will happily match a common
+    # Indian place name to an obscure town anywhere else in the
+    # world - e.g. "Mangalore" resolved to a village of 421 people
+    # in Tasmania, Australia, ahead of Mangaluru, India (population
+    # ~500,000), because the API ranks by relevance/exact-match, not
+    # population, and doesn't know which country actually matters
+    # here. Bias to India first; only fall back to an unrestricted
+    # worldwide search if nothing in India matches at all.
+    for country_code in ("IN", None):
+
+        try:
+
+            params = {
+                "name": location,
+                "count": 1,
+                "language": "en",
+                "format": "json",
+            }
+
+            if country_code:
+                params["countryCode"] = country_code
+
+            response = requests.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params=params,
+                timeout=10,
+            )
+
+            if not response.ok:
+                continue
+
+            data = response.json()
+
+            results = (
+                data.get("results")
+                or []
+            )
+
+            if results:
+                break
+
+        except Exception:
+            continue
+
+    else:
+        return None
+
+    try:
+
+        result = results[0]
+
+        latitude = result.get("latitude")
+        longitude = result.get("longitude")
+
+        if latitude is None or longitude is None:
+            return None
+
+        name = (
+            result.get("name")
+            or result.get("city")
+            or result.get("town")
+            or result.get("village")
+            or location
+        )
+
+        state = result.get("admin1")
+        country = result.get("country_code")
+
+        parts = [name]
+
+        if state and state != name:
+            parts.append(state)
+
+        if country and country != "IN":
+            parts.append(country)
+
+        return {
+            "latitude": _safe_float(latitude),
+            "longitude": _safe_float(longitude),
+            "name": ", ".join(parts),
+        }
+
+    except Exception as exc:
+
+        print(
+            "[WEATHER] "
+            "Forward geocoding failed:",
+            exc,
+        )
+
+        return None
+
+
+# ============================================================
 # FETCH OPEN-METEO DATA
 # ============================================================
 
@@ -824,11 +934,310 @@ def _build_current(
 
 
 # ============================================================
+# OPENWEATHER CURRENT CONDITIONS
+# ============================================================
+#
+# OpenWeatherMap's current-weather endpoint is backed by real
+# weather station observations where available ("base":
+# "stations"), which tends to track a farmer's own thermometer
+# more closely than Open-Meteo's pure grid-model interpolation.
+#
+# It is used for "right now" fields only. Rain probability and
+# the 7-day forecast still come from Open-Meteo, since
+# OpenWeatherMap's free current-weather endpoint has no
+# precipitation-probability field.
+# ============================================================
+
+def _fetch_openweather_current(
+    latitude: float,
+    longitude: float,
+) -> Optional[Dict[str, Any]]:
+
+    api_key = getattr(
+        settings,
+        "openweather_api_key",
+        "",
+    ) if settings else ""
+
+    if not api_key:
+        return None
+
+    try:
+
+        response = requests.get(
+            OPENWEATHER_CURRENT_URL,
+            params={
+                "lat": latitude,
+                "lon": longitude,
+                "appid": api_key,
+                "units": "metric",
+            },
+            timeout=10,
+        )
+
+        if not response.ok:
+
+            print(
+                "[WEATHER] OpenWeather request failed:",
+                response.status_code,
+                response.text,
+            )
+
+            return None
+
+        return response.json()
+
+    except Exception as exc:
+
+        print(
+            "[WEATHER] OpenWeather request error:",
+            exc,
+        )
+
+        return None
+
+
+def _build_current_from_openweather(
+    ow_data: Dict[str, Any],
+    rain_probability: int,
+    location_name: str,
+) -> Optional[Dict[str, Any]]:
+
+    main = ow_data.get("main") or {}
+    wind = ow_data.get("wind") or {}
+    sys_info = ow_data.get("sys") or {}
+    weather_list = ow_data.get("weather") or []
+
+    if "temp" not in main:
+        return None
+
+    timezone_offset = _safe_int(
+        ow_data.get("timezone"),
+        0,
+    )
+
+    def _format_unix(value: Any) -> str:
+
+        try:
+
+            timestamp = int(value) + timezone_offset
+
+            return datetime.fromtimestamp(
+                timestamp,
+                tz=timezone.utc,
+            ).strftime("%H:%M")
+
+        except Exception:
+
+            return "--:--"
+
+    condition = (
+        weather_list[0].get("description", "").title()
+        if weather_list
+        else "Unknown"
+    )
+
+    ow_name = str(ow_data.get("name") or "").strip()
+    country = (
+        (ow_data.get("sys") or {}).get("country") or ""
+    ).strip()
+
+    resolved_location = location_name
+
+    if ow_name:
+
+        resolved_location = (
+            f"{ow_name}, {country}"
+            if country and country != "IN"
+            else ow_name
+        )
+
+    return {
+
+        "location": resolved_location,
+
+        "temperature": round(
+            _safe_float(main.get("temp")),
+            1,
+        ),
+
+        "condition": condition or "Unknown",
+
+        "feels_like": round(
+            _safe_float(main.get("feels_like")),
+            1,
+        ),
+
+        "humidity": _safe_int(main.get("humidity")),
+
+        "rain_probability": _clamp(
+            rain_probability,
+            0,
+            100,
+        ),
+
+        "wind_speed":
+            f"{_safe_float(wind.get('speed')):.2f} m/s",
+
+        "wind_direction":
+            f"{_safe_int(wind.get('deg'))}°",
+
+        "sunrise": _format_unix(sys_info.get("sunrise")),
+
+        "sunset": _format_unix(sys_info.get("sunset")),
+    }
+
+
+# ============================================================
+# OPENWEATHER FORECAST (FOR RAIN-PROBABILITY BLENDING)
+# ============================================================
+#
+# Open-Meteo's daily precipitation_probability_max is a single
+# model's estimate. OpenWeatherMap's 3-hourly forecast is
+# produced by an independent model/pipeline. Averaging two
+# independent forecasts (a small multi-model ensemble) is a
+# standard way to reduce single-model bias and generally
+# improves rain-probability calibration versus either model
+# alone. OpenWeatherMap's free tier only covers ~5 days, so
+# days 6-7 keep using Open-Meteo alone.
+# ============================================================
+
+def _fetch_openweather_forecast(
+    latitude: float,
+    longitude: float,
+) -> Optional[Dict[str, Any]]:
+
+    api_key = getattr(
+        settings,
+        "openweather_api_key",
+        "",
+    ) if settings else ""
+
+    if not api_key:
+        return None
+
+    try:
+
+        response = requests.get(
+            OPENWEATHER_FORECAST_URL,
+            params={
+                "lat": latitude,
+                "lon": longitude,
+                "appid": api_key,
+                "units": "metric",
+            },
+            timeout=15,
+        )
+
+        if not response.ok:
+
+            print(
+                "[WEATHER] OpenWeather forecast "
+                "request failed:",
+                response.status_code,
+                response.text,
+            )
+
+            return None
+
+        return response.json()
+
+    except Exception as exc:
+
+        print(
+            "[WEATHER] OpenWeather forecast "
+            "request error:",
+            exc,
+        )
+
+        return None
+
+
+def _aggregate_openweather_daily(
+    ow_forecast: Dict[str, Any],
+) -> Dict[str, Dict[str, float]]:
+    """Group OpenWeatherMap's 3-hour steps into per-local-date
+    rain probability (max pop for the day) and rain totals.
+    """
+
+    city = ow_forecast.get("city") or {}
+
+    tz_offset = _safe_int(
+        city.get("timezone"),
+        0,
+    )
+
+    buckets: Dict[str, Dict[str, Any]] = {}
+
+    for entry in (ow_forecast.get("list") or []):
+
+        dt = entry.get("dt")
+
+        if dt is None:
+            continue
+
+        try:
+
+            local_dt = datetime.fromtimestamp(
+                int(dt) + tz_offset,
+                tz=timezone.utc,
+            )
+
+        except Exception:
+            continue
+
+        date_key = local_dt.strftime("%Y-%m-%d")
+
+        bucket = buckets.setdefault(
+            date_key,
+            {"pop_values": [], "rain_mm": 0.0, "slots": 0},
+        )
+
+        pop = entry.get("pop")
+
+        if pop is not None:
+            bucket["pop_values"].append(
+                _safe_float(pop) * 100
+            )
+
+        rain_block = entry.get("rain") or {}
+        snow_block = entry.get("snow") or {}
+
+        bucket["rain_mm"] += _safe_float(
+            rain_block.get("3h"), 0.0
+        ) + _safe_float(
+            snow_block.get("3h"), 0.0
+        )
+
+        bucket["slots"] += 1
+
+    daily: Dict[str, Dict[str, float]] = {}
+
+    for date_key, bucket in buckets.items():
+
+        pop_values = bucket["pop_values"]
+
+        daily[date_key] = {
+            "rain_probability":
+                max(pop_values) if pop_values else None,
+            "rain_mm": bucket["rain_mm"],
+            # A day needs most of its 8 three-hour slots present
+            # before its rainfall TOTAL is trustworthy enough to
+            # blend in (a partial day undercounts total mm even
+            # though its peak probability is still informative).
+            "full_day": bucket["slots"] >= 6,
+        }
+
+    return daily
+
+
+# ============================================================
 # BUILD 7-DAY FORECAST
 # ============================================================
 
 def _build_forecast(
     data: Dict[str, Any],
+    owm_daily: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> List[Dict[str, Any]]:
 
     daily = (
@@ -966,6 +1375,32 @@ def _build_forecast(
             rain_amount,
             total_precipitation,
         )
+
+        # ----------------------------------------------------
+        # BLEND WITH OPENWEATHER (INDEPENDENT MODEL)
+        # ----------------------------------------------------
+
+        owm_day = (
+            owm_daily.get(date_string)
+            if owm_daily
+            else None
+        )
+
+        if owm_day:
+
+            owm_probability = owm_day.get(
+                "rain_probability"
+            )
+
+            if owm_probability is not None:
+                rain_probability = round(
+                    (rain_probability + owm_probability) / 2
+                )
+
+            if owm_day.get("full_day"):
+                rainfall_mm = (
+                    rainfall_mm + owm_day.get("rain_mm", 0.0)
+                ) / 2
 
         weather_info = _weather_info(
             weather_code
@@ -1133,6 +1568,38 @@ def _build_alerts(
                 }
             )
 
+        # ------------------------------------------------------
+        # HIGH-PROBABILITY / LOW-VOLUME DAYS
+        #
+        # A near-certain drizzle (e.g. 85% chance, 1 mm) still
+        # ruins pesticide/fertilizer spraying and harvest timing
+        # even though it never clears the rainfall-amount
+        # thresholds above. Farmers plan around the CHANCE of
+        # rain, not only the volume, so flag high probability on
+        # its own.
+        # ------------------------------------------------------
+
+        elif rain_probability >= 85:
+
+            alerts.append(
+                {
+
+                    "level": "Medium",
+
+                    "title":
+                        f"High Chance of Rain on "
+                        f"{day_name}",
+
+                    "body":
+                        f"{rain_probability}% chance "
+                        f"of precipitation, though only "
+                        f"light rainfall "
+                        f"(~{rain_mm:.1f} mm) is expected. "
+                        f"Avoid spraying and plan harvesting "
+                        f"around this.",
+                }
+            )
+
     return alerts
 
 
@@ -1148,15 +1615,37 @@ def get_weather(
 
     # --------------------------------------------------------
     # NO DEFAULT CITY
+    #
+    # If GPS coordinates are missing but a place name was
+    # supplied (e.g. the farmer asked "weather in Davangere"),
+    # resolve that name to coordinates via forward geocoding
+    # instead of failing outright.
     # --------------------------------------------------------
+
+    geocoded_name: Optional[str] = None
 
     if lat is None or lng is None:
 
-        raise ValueError(
-            "GPS coordinates are required. "
-            "The browser/device must provide "
-            "latitude and longitude."
-        )
+        if not location:
+
+            raise ValueError(
+                "GPS coordinates are required. "
+                "The browser/device must provide "
+                "latitude and longitude."
+            )
+
+        geocoded = _geocode_location(location)
+
+        if not geocoded:
+
+            raise ValueError(
+                f"Could not resolve location '{location}' "
+                "to coordinates."
+            )
+
+        lat = geocoded["latitude"]
+        lng = geocoded["longitude"]
+        geocoded_name = geocoded["name"]
 
     latitude = _safe_float(
         lat,
@@ -1238,7 +1727,7 @@ def get_weather(
     #
     # --------------------------------------------------------
 
-    location_name = _get_location_name(
+    location_name = geocoded_name or _get_location_name(
         latitude,
         longitude,
         location,
@@ -1267,8 +1756,78 @@ def get_weather(
         location_name,
     )
 
+    # --------------------------------------------------------
+    # OPENWEATHER OVERRIDE
+    #
+    # When available, prefer OpenWeatherMap's station-based
+    # current conditions over Open-Meteo's grid-model estimate
+    # for "right now" fields. Rain probability keeps coming
+    # from Open-Meteo, which is the only one of the two that
+    # supplies it. If OpenWeatherMap is unavailable or the
+    # response is malformed, the Open-Meteo current block
+    # computed above is used unchanged.
+    # --------------------------------------------------------
+
+    ow_data = _fetch_openweather_current(
+        latitude,
+        longitude,
+    )
+
+    if ow_data:
+
+        ow_current = _build_current_from_openweather(
+            ow_data,
+            current["rain_probability"],
+            location_name,
+        )
+
+        if ow_current:
+
+            print(
+                "Using OpenWeatherMap for "
+                "current conditions."
+            )
+
+            current = ow_current
+
+    # --------------------------------------------------------
+    # OPENWEATHER FORECAST BLEND (RAIN ACCURACY)
+    # --------------------------------------------------------
+
+    owm_daily = None
+
+    ow_forecast = _fetch_openweather_forecast(
+        latitude,
+        longitude,
+    )
+
+    if ow_forecast:
+
+        try:
+            owm_daily = _aggregate_openweather_daily(
+                ow_forecast
+            )
+
+            print(
+                "Blending OpenWeatherMap forecast "
+                "into",
+                len(owm_daily),
+                "day(s) of rain prediction.",
+            )
+
+        except Exception as exc:
+
+            print(
+                "[WEATHER] OpenWeather forecast "
+                "aggregation failed:",
+                exc,
+            )
+
+            owm_daily = None
+
     forecast = _build_forecast(
         data,
+        owm_daily,
     )
 
     alerts = _build_alerts(

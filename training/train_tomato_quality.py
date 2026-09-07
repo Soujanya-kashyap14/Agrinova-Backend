@@ -32,6 +32,7 @@ from pathlib import Path
 import numpy as np
 import tensorflow as tf
 
+from tensorflow import keras
 from tensorflow.keras import layers, models
 from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
@@ -49,6 +50,11 @@ EPOCHS_HEAD = 8
 EPOCHS_FINE = 8
 
 BASE_DIR = Path(__file__).resolve().parents[1]
+
+# Add manually reviewed images captured outside the original datasets here:
+# tomato_generalization/quality/fresh, tomato_generalization/quality/rotten
+# tomato_generalization/maturity/immature, tomato_generalization/maturity/mature
+GENERALIZATION_DIR = BASE_DIR / "datasets" / "tomato_generalization"
 
 DATASET_DIR = (
     BASE_DIR
@@ -172,6 +178,42 @@ def list_images(folder: Path) -> list[Path]:
     return sorted(result)
 
 
+def prepare_training_directory(
+    directory: Path,
+    model_name: str,
+) -> Path:
+    """Merge the base dataset with manually reviewed field images."""
+    merged = MODEL_DIR / f"_merged_{model_name}"
+
+    if merged.exists():
+        shutil.rmtree(merged)
+
+    for class_name in sorted(
+        path.name
+        for path in directory.iterdir()
+        if path.is_dir()
+    ):
+        destination = merged / class_name
+        destination.mkdir(parents=True, exist_ok=True)
+
+        sources = [directory / class_name]
+        extra = GENERALIZATION_DIR / model_name / class_name
+        if extra.is_dir():
+            sources.append(extra)
+
+        image_index = 0
+        for source in sources:
+            for image_path in list_images(source):
+                destination_path = (
+                    destination
+                    / f"{image_index:08d}{image_path.suffix.lower()}"
+                )
+                shutil.copy2(image_path, destination_path)
+                image_index += 1
+
+    return merged
+
+
 # ============================================================
 # DATASET LOADING
 # ============================================================
@@ -237,9 +279,11 @@ def build_model() -> tuple[models.Model, tf.keras.Model]:
     data_augmentation = tf.keras.Sequential(
         [
             layers.RandomFlip("horizontal"),
-            layers.RandomRotation(0.08),
-            layers.RandomZoom(0.10),
-            layers.RandomContrast(0.10),
+            layers.RandomRotation(0.15),
+            layers.RandomZoom((-0.15, 0.25)),
+            layers.RandomTranslation(0.12, 0.12),
+            layers.RandomContrast(0.20),
+            layers.RandomBrightness(0.18),
         ],
         name="augmentation",
     )
@@ -306,13 +350,54 @@ def train_binary_model(
         f"TRAINING {model_name.upper()} MODEL"
     )
 
+    training_directory = prepare_training_directory(
+        directory,
+        model_name="quality" if "quality" in model_name else "maturity",
+    )
+
     (
         train_ds,
         validation_ds,
         class_names,
-    ) = load_dataset(directory)
+    ) = load_dataset(training_directory)
 
     model, base = build_model()
+
+    class_counts = {
+        class_name: len(list_images(training_directory / class_name))
+        for class_name in class_names
+    }
+    total_images = sum(class_counts.values())
+    class_weight = {
+        index: total_images / (
+            len(class_names) * class_counts[class_name]
+        )
+        for index, class_name in enumerate(class_names)
+    }
+
+    callbacks = [
+        keras.callbacks.ModelCheckpoint(
+            model_path,
+            monitor="val_auc",
+            mode="max",
+            save_best_only=True,
+            verbose=1,
+        ),
+        keras.callbacks.EarlyStopping(
+            monitor="val_auc",
+            mode="max",
+            patience=4,
+            restore_best_weights=True,
+            verbose=1,
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.3,
+            patience=2,
+            min_lr=1e-7,
+            verbose=1,
+        ),
+    ]
 
     model.compile(
         optimizer=tf.keras.optimizers.Adam(
@@ -320,7 +405,10 @@ def train_binary_model(
         ),
         loss="binary_crossentropy",
         metrics=[
-            "accuracy"
+            "accuracy",
+            tf.keras.metrics.AUC(name="auc"),
+            tf.keras.metrics.Precision(name="precision"),
+            tf.keras.metrics.Recall(name="recall"),
         ],
     )
 
@@ -331,6 +419,8 @@ def train_binary_model(
         train_ds,
         validation_data=validation_ds,
         epochs=EPOCHS_HEAD,
+        callbacks=callbacks,
+        class_weight=class_weight,
     )
 
     # --------------------------------------------------------
@@ -359,7 +449,10 @@ def train_binary_model(
         ),
         loss="binary_crossentropy",
         metrics=[
-            "accuracy"
+            "accuracy",
+            tf.keras.metrics.AUC(name="auc"),
+            tf.keras.metrics.Precision(name="precision"),
+            tf.keras.metrics.Recall(name="recall"),
         ],
     )
 
@@ -367,6 +460,8 @@ def train_binary_model(
         train_ds,
         validation_data=validation_ds,
         epochs=EPOCHS_FINE,
+        callbacks=callbacks,
+        class_weight=class_weight,
     )
 
     # --------------------------------------------------------
