@@ -1,12 +1,5 @@
-"""
-API route modules.
-"""
+"""API route package.
 
-from . import auth
-from . import upload
-from . import predict
-from . import weather
-#from . import mandi
-from . import price
-from . import history
-from . import voice
+Route modules are imported explicitly by ``app.py`` so an optional service
+failure cannot prevent unrelated routers from loading.
+"""
