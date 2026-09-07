@@ -65,4 +65,16 @@ class MandiListResponse(BaseModel):
 
     searched_longitude: float | None = None
 
+    location_label: str | None = None
+
+    search_mode: str | None = None
+
+    sorted_by: str | None = None
+
+    sort_order: str | None = None
+
+    farthest_distance_km: float | None = None
+
+    ceda_live: bool = False
+
     source: str = "CEDA / AGMARKNET"
